@@ -1,0 +1,333 @@
+#pragma comment(lib,"ws2_32.lib")
+#include <stdlib.h>
+#include <time.h>
+#include <WinSock2.h>
+#include <fstream>
+#include <iostream>
+#include <cstdint>
+#include <vector>
+#include <string> 
+#include <ws2tcpip.h>
+
+#define SERVER_IP    "127.0.0.1"  // 服务器IP地址 
+#define SERVER_PORT  6666		// 服务器端口号
+#define BUFFER sizeof(Packet)  //缓冲区大小
+#define TIMEOUT 5  //超时，单位s，代表一组中的所有ack都正确接收
+
+using namespace std;
+
+SOCKADDR_IN addrServer;   //服务器地址
+SOCKADDR_IN addrClient;   //客户端地址
+
+SOCKET sockServer;//服务器套接字
+SOCKET sockClient;//客户端套接字
+int recvSize;
+int length = sizeof(SOCKADDR);
+int nowSeq = 0;
+int nowAck = 0;
+
+enum ConnectionState {// 枚举，数据包类型
+	ConnectRequest, ServerPrepared, ClientPrepared, LeaveRequest, AcceptLeave = 10
+};
+enum MessageType {
+	SendHeader = 4, Message = 5, SendTail = 6, replyMessage = 7, replyHeader = 8
+};
+struct Packet
+{
+	unsigned char flg;//连接建立、断开标识，表示数据包类型
+	int seq;//序列号
+	int ack;//确认号
+	unsigned short len;//数据部分长度
+	unsigned short checksum;//校验和
+	char data[8192];//数据长度
+	Packet() :flg(-1), seq(-1), ack(-1), len(8192), checksum(65535) {// 构造函数初始化
+		memset(data, 0, sizeof(data));
+	}
+	Packet(unsigned char flg) :flg(flg), seq(-1), ack(-1), len(8192), checksum(65535) {// 有参数的构造函数
+		memset(data, 0, sizeof(data));
+	}
+
+	void toString() {
+		cout << "-------------Packet-----------------" << endl;
+		switch (flg) {
+		case ConnectRequest: {
+			cout << "flg: ConnectRequest" << endl;
+			break;
+		}
+		case ServerPrepared: {
+			cout << "flg: ServerPrepared" << endl;
+			break;
+
+		}
+		case ClientPrepared: {
+			cout << "flg: ClientPrepared" << endl;
+			break;
+		}
+		case SendHeader: {
+			cout << "flg: SendHeader" << endl;
+			break;
+		}
+		case Message: {
+			cout << "flg: Message" << endl;
+			break;
+		}
+		case SendTail: {
+			cout << "flg: SendTail" << endl;
+			break;
+		}
+		case replyMessage: {
+			cout << "flg: replyMessage" << endl;
+			break;
+		}
+		}
+		cout << "seq: " << seq << endl;
+		cout << "ack: " << ack << endl;
+		cout << "len: " << len << endl;
+		cout << "checksum: " << checksum << endl;
+		if (flg == SendHeader) {
+			cout << "File DIR: ";
+			for (int i = 0; i < len; i++) {
+				cout << data[i];
+			}
+			cout << endl;
+		}
+	}
+	unsigned short makeCheckSum() {
+		unsigned long sum = 0;
+		sum += this->flg;
+		sum = (sum >> 16) + (sum & 0xffff);//将进位加回到低十六位
+		sum += this->seq;
+		sum = (sum >> 16) + (sum & 0xffff);
+		sum += this->ack;
+		sum = (sum >> 16) + (sum & 0xffff);
+		sum += this->len;
+		sum = (sum >> 16) + (sum & 0xffff);
+		for (int i = 0; i < 8192; i++) {
+			sum += this->data[i];
+			sum = (sum >> 16) + (sum & 0xffff);
+		}
+		return ~sum;//按位取反，方便接收端比对
+	}
+	void Package(int seq, int ack) {
+		this->seq = seq;
+		this->ack = ack;
+		this->checksum = makeCheckSum();
+	}
+	bool IsCorrect() {// 检验
+		unsigned short nowCheckSum = makeCheckSum();
+		if (this->checksum == (nowCheckSum & 0xffff))return true;
+		return false;
+	}
+};
+//握手建立连接
+bool shakeHands() {
+	Packet* packet = new Packet();// 创建数据报准备接收请求
+	int state = -1;// 初始状态为等待客户端请求状态
+	while (true) {// 持续监听等待客户端请求
+		recvSize = recvfrom(sockServer, (char *)packet, BUFFER, 0, ((SOCKADDR *)&addrClient), &length);
+		if (recvSize > 0 && packet->flg == ConnectRequest) {
+			state = ConnectRequest;// 如果收到请求，开始握手
+
+			while (true) {
+				switch (state) {
+				case ConnectRequest: {// 收到客户端请求后，发送服务器已准备数据报
+					cout << "Get Connection Request...PleaseWait" << endl;
+					Packet* serverPacket = new Packet(ServerPrepared);// 创建一个flg为ServerPrepared的数据包，表示服务器端已经准备连接
+					sendto(sockServer, (char*)serverPacket, BUFFER, 0, (SOCKADDR*)&addrClient, sizeof(SOCKADDR));
+					cout << "send successfully" << endl;
+					state = ServerPrepared;// 更改状态
+					break;
+				}
+				case ServerPrepared: {//服务器已准备，持续监听客户端已准备的信息
+					recvSize = recvfrom(sockServer, (char *)packet, BUFFER, 0, ((SOCKADDR *)&addrClient), &length);
+					if (recvSize > 0 && packet->flg == ClientPrepared) {// 如果接收到的数据包的flg为ClientPrepared，即客服端与服务器端成功三次握手
+						cout << "Client Connected Successfully." << endl;
+						return true;
+					}
+				}
+				}
+			}
+		}
+		else {//每2s检查一次是否有客户端请求
+			cout << "No Client Request." << endl;
+			Sleep(2000);
+			continue;
+		}
+	}
+	return false;
+}
+//挥手断开连接
+bool waveHands() {
+	Packet* packet = new Packet();
+	while (true) {
+		recvSize = recvfrom(sockServer, (char *)packet, BUFFER, 0, ((SOCKADDR *)&addrClient), &length);
+		if (recvSize > 0 && packet->flg == LeaveRequest && packet->IsCorrect()) {// 如果接收到flg等于LeaveRequest的数据包，即客服端请求断开连接
+			cout << "The Client is about to leave." << endl;
+			Packet* serverPacket = new Packet(AcceptLeave);// 发送一个确认断开的数据包断开连接
+			serverPacket->Package(-1, -1);
+			sendto(sockServer, (char*)serverPacket, BUFFER, 0, (SOCKADDR*)&addrClient, sizeof(SOCKADDR));
+			return true;
+		}
+	}
+	return false;
+}
+int main()
+{
+	WORD wVersionRequested = MAKEWORD(2, 2); //winSocket2.2
+	WSADATA wsaData;
+	int error = WSAStartup(wVersionRequested, &wsaData);//错误提示
+	if (error) {
+		cout << "找不到winsock.dll" << endl;
+		return 0;
+	}
+	sockServer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);// 创建数据报套接字库
+	int iMode = 1; 
+	ioctlsocket(sockServer, FIONBIO, (u_long FAR*) & iMode);// 设置套接字为非阻塞模式，ioctlsocket(sockServer, FIONBIO, &iMode);
+	// addrServer.sin_addr.S_un.S_addr = htonl(INADDR_ANY);// 监听任何可用的网络接口
+	// addrServer.sin_family = AF_INET;// ipv4
+	// addrServer.sin_port = htons(SERVER_PORT);// 监听的特定端口
+	// inet_pton(AF_INET, "127.0.0.1", &(addrServer.sin_addr)); // 绑定到固定的IP地址
+
+	addrServer.sin_family = AF_INET;
+	addrServer.sin_port = htons(12345);
+	//server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	inet_pton(AF_INET, "127.0.0.1", &addrServer.sin_addr.S_un.S_addr);
+
+	addrClient.sin_family = AF_INET;
+	addrClient.sin_port = htons(6666);
+	//server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	inet_pton(AF_INET, "127.0.0.1", &addrClient.sin_addr.S_un.S_addr);
+
+
+	error = bind(sockServer, (SOCKADDR*)&addrServer, sizeof(SOCKADDR));// 套接字和指定的 IP 地址和端口进行绑定
+	if (error) {
+		cout << "端口绑定失败: " << SERVER_PORT << endl;
+		WSACleanup();
+		return 0;
+	}
+	else
+	{
+		cout << "服务器创建成功" << endl;
+	}
+	sockaddr_in localAddr;
+	int addrLen = sizeof(localAddr);
+	if (getsockname(sockServer, (sockaddr*)&localAddr, &addrLen) == SOCKET_ERROR) {
+		std::cerr << "Failed to get local address" << std::endl;
+	}
+	else {
+		char ipStr[INET_ADDRSTRLEN];
+		unsigned short port;
+
+		inet_ntop(AF_INET, &(localAddr.sin_addr), ipStr, INET_ADDRSTRLEN);
+		port = ntohs(localAddr.sin_port);
+
+		std::cout << "Local IP Address: " << ipStr << std::endl;
+		std::cout << "Local Port: " << port << std::endl;
+
+	}
+
+
+	while (true) {
+		if (shakeHands()) {
+			string filepath;
+
+			while (true) {
+				cout << "Input your file path: ";
+				cin >> filepath;
+				ifstream infile(filepath, ifstream::in | ios::binary);//以二进制方式打开文件
+				if (!infile.is_open()) {
+					cout << "Cannot open the file" << endl;
+					continue;
+				}
+				infile.seekg(0, std::ios_base::end);  //将文件指针定位到文件尾
+				int fileLength = infile.tellg();
+				int packetnum = (fileLength + 8191) / 8192;// 计算数据包数量
+				cout << "The File " << filepath << " contains " << fileLength << " Bytes, " << packetnum
+					<< "packets in total" << endl;
+				infile.seekg(0, std::ios_base::beg);  //将文件指针指向头部
+				//组装文件头数据报
+				Packet *HeaderPackage = new Packet(SendHeader);// flg设置为SendHeader
+				for (int i = 0; i < filepath.length(); i++) { HeaderPackage->data[i] = filepath[i]; }// 内容装的是文件路径
+				HeaderPackage->len = filepath.length();//数据长度
+				HeaderPackage->Package(nowSeq, -1);//设置seq,ack,checksum
+				sendto(sockServer, (char *)HeaderPackage, BUFFER, 0, (SOCKADDR *)&addrClient, sizeof(SOCKADDR));// 发送文件头部，告知文件信息
+				cout << "Send FileHeader successfully. seq = " << nowSeq++ << endl;
+
+				Packet *recvHeader = new Packet();
+				while (true) {
+					recvSize = recvfrom(sockServer, (char *)recvHeader, BUFFER, 0, ((SOCKADDR *)&addrClient),
+						&length);
+					if (recvSize < 0) {
+						Sleep(200);
+						continue;
+					}
+					if (recvHeader->flg == replyHeader && recvHeader->IsCorrect() && recvHeader->ack == nowAck) {// 如果接收的flg是replyHeader
+						cout << "Client Prepared to receive File." << endl;
+						nowAck++;
+						break;
+					}
+				}
+
+				clock_t begin = clock();  // 记录开始时间
+				//开始顺序发送
+				for (int i = 1; i <= packetnum; i++) {
+					Packet *MessagePacket = new Packet(Message);// flg = Message
+					Packet *recvPacket = new Packet();
+					int dataLength = min(8192, fileLength);
+					fileLength -= 8192;// 记录剩余文件长度
+					infile.read(MessagePacket->data, dataLength);
+					MessagePacket->len = dataLength;
+					if (i == packetnum)MessagePacket->flg = SendTail;// 如果是文件末尾，要用特殊的SendTail标识
+					MessagePacket->Package(nowSeq, -1);// 这里只发生不确认
+					sendto(sockServer, (char *)MessagePacket, BUFFER, 0, (SOCKADDR *)&addrClient, sizeof(SOCKADDR));
+					cout << "Send File section，seq = " << nowSeq++ << endl;// 发送一个数据包，seq加一
+					int waittime = 0;// 记录等待时间，实现超时重传机制
+					while (true) {
+						recvSize = recvfrom(sockServer, (char *)recvPacket, BUFFER, 0, ((SOCKADDR *)&addrClient),
+							&length);
+						// 超时重传
+						if (recvSize < 0) {
+							Sleep(200);// 每200毫秒检查一下应答消息
+							waittime++;
+							if (waittime > 10) {// 超过10次检查还没有收到就认为应答超时
+								cout << "Reply Time Out" << endl;
+								sendto(sockServer, (char *)MessagePacket, BUFFER, 0, (SOCKADDR *)&addrClient,// 重新发送数据包
+									sizeof(SOCKADDR));
+								waittime = 0;// 等待时间清零
+							}
+							continue;
+						}
+						// 如果数据报类型为replyMessage应答消息，并且数据报正确发送，应答消息Ack号与期望Ack号相等
+						if (recvPacket->flg == replyMessage && recvPacket->IsCorrect() && recvPacket->ack == nowAck) {
+							//输出提示信息
+							cout << "get receive Message from Client. ack = " << nowAck << endl;
+							nowAck++;
+							break;
+						}
+						else {//否则就需要重新传输当前数据报
+							cout << "--------------------------------------------get error reply.----------------------------------------" << endl;
+							cout << "--------------------------------------------get error reply.----------------------------------------" << endl;
+							cout << "--------------------------------------------get error reply.----------------------------------------" << endl;
+							sendto(sockServer, (char *)MessagePacket, BUFFER, 0, (SOCKADDR *)&addrClient,
+								sizeof(SOCKADDR));
+							waittime = 0;//刷新等待时间
+						}
+					}
+				}
+
+				clock_t end = clock();  // 记录结束时间
+				cout << "Finish uploading." << endl;
+
+				double transferTime = double(end - begin) / CLOCKS_PER_SEC;
+				cout << "传输时间: " << transferTime * 1000 << "ms" << endl;  // 转换为毫秒
+				cout << "吞吐率: " << -(double(fileLength) / transferTime) << "bytes/s" << endl;
+				cout << "Do you want to upload again?(y/n)" << endl;// 退出机制
+				char option;
+				cin >> option;
+				if (option == 'n')break;
+			}
+			waveHands();// 挥手，断开连接
+		}
+	}
+	return 0;
+}
